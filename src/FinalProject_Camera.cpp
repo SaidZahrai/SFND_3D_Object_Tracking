@@ -76,7 +76,7 @@ int main(int argc, const char *argv[])
 /********************************************************************************************/
 
     //// Default settings:
-    bool bVis = false;            // visualize results
+    bool bVis = true;            // visualize results
     string detectorType = "FAST"; // "FAST"; // "ORB"; // "HARRIS"; // "SIFT"; // "SHITOMASI"; // "AKAZE"; // 
     string descriptorType = "BRIEF"; // "BRIEF"; // "BRISK"; // "FREAK"; // "ORB"; //  "AKAZE"; // "SIFT"; //
     string matcherType = "MAT_BF";        // "MAT_BF"; // "MAT_FLANN"; //
@@ -84,6 +84,8 @@ int main(int argc, const char *argv[])
 
     if (argc == 1)
     {
+        cout << "\nTo disable graphics and run with default settings, execute:\n";
+        cout << "\t3D_object_tracking OFF\n\n";
         cout << "You have started the program without any arguments. This is similar to:\n";
         cout << "\t3D_object_tracking FAST BRIEF MAT_BF SEL_KNN OFF\n";
         cout << "meaning you intend to run 2D_feature_tracking with\n";
@@ -91,9 +93,19 @@ int main(int argc, const char *argv[])
         cout << "\tDescriptor: BRIEF [BRIEF/BRISK/FREAK/ORB/AKAZE/SIFT]\n";
         cout << "\tMatcher: MAT_BF [MAT_BF/MAT_FLANN]\n";
         cout << "\tSelector: SEL_KNN [SEL_NN/SEL_KNN]\n";
-        cout << "\tVisualization: OFF [ON/OFF]\n";
+        cout << "\tVisualization: ON [ON/OFF]\n";
         cout << "\n";
         cout << "Please try with other combinations of interest!\n";
+    } 
+    else if (argc == 2)
+    {
+        bVis = string(argv[1]).compare("ON") == 0;
+        if (!((string(argv[1]).compare("ON") == 0) || (string(argv[1]).compare("OFF") == 0)))
+        {
+            cout << string(argv[1]) << " not recognized. Please check your choice for visualization.\n";
+            cout << "\tVisualization: [ON/OFF]\n";
+            return 1;
+        }
     } 
     else if (argc == 6)
     {
