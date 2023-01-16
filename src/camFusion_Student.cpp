@@ -2,11 +2,13 @@
 #include <iostream>
 #include <algorithm>
 #include <numeric>
+#include <list>
 #include <opencv2/highgui/highgui.hpp>
 #include <opencv2/imgproc/imgproc.hpp>
 
 #include "camFusion.hpp"
 #include "dataStructures.h"
+#include "clustering.h"
 
 using namespace std;
 
@@ -107,11 +109,12 @@ void show3DObjects(std::vector<BoundingBox> &boundingBoxes, cv::Size worldSize, 
         cv::rectangle(topviewImg, cv::Point(left, top), cv::Point(right, bottom),cv::Scalar(0,0,0), 2);
 
         // augment object with some key data
+        int textScale = 2;
         char str1[200], str2[200];
         sprintf(str1, "id=%d, #pts=%d", it1->boxID, (int)it1->lidarPoints.size());
-        putText(topviewImg, str1, cv::Point2f(left-250, bottom+50), cv::FONT_ITALIC, 2, currColor);
+        putText(topviewImg, str1, cv::Point2f((left-250)/textScale, (bottom+50)/textScale), cv::FONT_ITALIC, 2/textScale, currColor);
         sprintf(str2, "xmin=%2.2f m, yw=%2.2f m", xwmin, ywmax-ywmin);
-        putText(topviewImg, str2, cv::Point2f(left-250, bottom+125), cv::FONT_ITALIC, 2, currColor);  
+        putText(topviewImg, str2, cv::Point2f((left-250)/textScale, (bottom+125)/textScale), cv::FONT_ITALIC, 2/textScale, currColor);  
     }
 
     // plot distance markers
@@ -134,30 +137,194 @@ void show3DObjects(std::vector<BoundingBox> &boundingBoxes, cv::Size worldSize, 
     }
 }
 
-
 // associate a given bounding box with the keypoints it contains
 void clusterKptMatchesWithROI(BoundingBox &boundingBox, std::vector<cv::KeyPoint> &kptsPrev, std::vector<cv::KeyPoint> &kptsCurr, std::vector<cv::DMatch> &kptMatches)
 {
-    // ...
+    for (auto match : kptMatches)
+    {
+        if (boundingBox.roi.contains(kptsCurr.at(match.trainIdx).pt))
+        {
+            boundingBox.kptMatches.push_back(match);
+            boundingBox.keypoints.push_back(kptsCurr.at(match.trainIdx));
+        }
+    }
 }
-
 
 // Compute time-to-collision (TTC) based on keypoint correspondences in successive images
 void computeTTCCamera(std::vector<cv::KeyPoint> &kptsPrev, std::vector<cv::KeyPoint> &kptsCurr, 
                       std::vector<cv::DMatch> kptMatches, double frameRate, double &TTC, cv::Mat *visImg)
 {
     // ...
+    // compute distance ratios between all matched keypoints
+    // This implementation is taken from course material with the mean replaced with median
+    vector<double> distRatios; // stores the distance ratios for all keypoints between curr. and prev. frame
+    for (auto it1 = kptMatches.begin(); it1 != kptMatches.end() - 1; ++it1)
+    { // outer kpt. loop
+
+        // get current keypoint and its matched partner in the prev. frame
+        cv::KeyPoint kpOuterCurr = kptsCurr.at(it1->trainIdx);
+        cv::KeyPoint kpOuterPrev = kptsPrev.at(it1->queryIdx);
+
+        for (auto it2 = kptMatches.begin() + 1; it2 != kptMatches.end(); ++it2)
+        { // inner kpt.-loop
+
+            double minDist = 100.0; // min. required distance
+
+            // get next keypoint and its matched partner in the prev. frame
+            cv::KeyPoint kpInnerCurr = kptsCurr.at(it2->trainIdx);
+            cv::KeyPoint kpInnerPrev = kptsPrev.at(it2->queryIdx);
+
+            // compute distances and distance ratios
+            double distCurr = cv::norm(kpOuterCurr.pt - kpInnerCurr.pt);
+            double distPrev = cv::norm(kpOuterPrev.pt - kpInnerPrev.pt);
+
+            if (distPrev > std::numeric_limits<double>::epsilon() && distCurr >= minDist)
+            { // avoid division by zero
+
+                double distRatio = distCurr / distPrev;
+                distRatios.push_back(distRatio);
+            }
+        } // eof inner loop over all matched kpts
+    }     // eof outer loop over all matched kpts
+
+    // only continue if list of distance ratios is not empty
+    if (distRatios.size() == 0)
+    {
+        TTC = NAN;
+        return;
+    }
+
+    // The median ratio value is used as input for calculation of TTC
+    std::sort(distRatios.begin(), distRatios.end());
+    long medIndex = floor(distRatios.size() / 2.0);
+    double medDistRatio = distRatios.size() % 2 == 0 ? (distRatios[medIndex - 1] + distRatios[medIndex]) / 2.0 : distRatios[medIndex]; // compute median dist. ratio to remove outlier influence
+
+    double dT = 1 / frameRate;
+    if (abs(medDistRatio - 1) < 1e-3)
+    {
+        TTC = 1e3;
+    }
+    else
+    {
+        TTC = dT / (medDistRatio - 1);
+    }
 }
 
-
+// Compute time-to-collision (TTC) based on Lidar points
+// The calculation based on the closest point distance was fluctuating considerably.
+// An implementation is proposed to cluster out areas with lower number of Lidar points.
+// Then, the closest point in the remaining clusters is used. 
 void computeTTCLidar(std::vector<LidarPoint> &lidarPointsPrev,
                      std::vector<LidarPoint> &lidarPointsCurr, double frameRate, double &TTC)
 {
-    // ...
+    double minXPrev = 1e9, minXCurr = 1e9;
+    double dT = 1 / frameRate; // time between two measurements in seconds
+
+    //// Use Euclidean Clustering for filtering out segments with fewwer number of points.
+    EuclideanClustering<LidarPoint> ecPrev(lidarPointsPrev), ecCurr(lidarPointsCurr);
+    float clusterTolerance = 0.2;
+    int minSize = 50, maxSize = 1000;
+
+    //// An unisotropic box is used to find points close to each other. The box is 5 times smaller in x-direction.
+    auto prev_cluster_indices = ecPrev.euclideanCluster({clusterTolerance/5, clusterTolerance, clusterTolerance}, minSize, maxSize);
+    auto curr_cluster_indices = ecCurr.euclideanCluster({clusterTolerance/5, clusterTolerance, clusterTolerance}, minSize, maxSize);
+
+    // cout << "Segmentation. Prev: " << prev_cluster_indices.size() << " Curr: " << curr_cluster_indices.size() << endl;
+
+    // find closest distance to Lidar points within ego lane
+    // For each segment, the points are first sorted and then either smaller or median point can be selected.
+    for (auto it1 = prev_cluster_indices.begin(); it1 != prev_cluster_indices.end(); it1++)
+    {
+        vector<LidarPoint> segPoints;
+        for (auto it2 = it1->begin(); it2 != it1->end(); it2++)
+        {
+            segPoints.push_back(lidarPointsPrev[*it2]);
+        }
+        std::sort(segPoints.begin(), segPoints.end(), [](LidarPoint a, LidarPoint b) {return a.x < b.x;});
+        long medIndex = floor(segPoints.size() / 2.0);
+        double medDist = segPoints.size() % 2 == 0 ? (segPoints[medIndex - 1].x + segPoints[medIndex].x) / 2.0 : segPoints[medIndex].x; // compute median dist. ratio to remove outlier influence
+
+        // Minimum distance point:
+        minXPrev = minXPrev > segPoints[0].x ? segPoints[0].x : minXPrev;
+        // Median distance point:
+        // minXPrev = minXPrev > medDist ? medDist : minXPrev;
+    }
+    for (auto it1 = curr_cluster_indices.begin(); it1 != curr_cluster_indices.end(); it1++)
+    {
+        vector<LidarPoint> segPoints;
+        for (auto it2 = it1->begin(); it2 != it1->end(); it2++)
+        {
+            segPoints.push_back(lidarPointsCurr[*it2]);
+        }
+        std::sort(segPoints.begin(), segPoints.end(), [](LidarPoint a, LidarPoint b) {return a.x < b.x;});
+        long medIndex = floor(segPoints.size() / 2.0);
+        double medDist = segPoints.size() % 2 == 0 ? (segPoints[medIndex - 1].x + segPoints[medIndex].x) / 2.0 : segPoints[medIndex].x; // compute median dist. ratio to remove outlier influence
+
+        // Minimum distance point:
+        minXCurr = minXCurr > segPoints[0].x ? segPoints[0].x : minXCurr;
+        // Median distance point:
+        // minXCurr = minXCurr > medDist ? medDist : minXCurr;
+    }
+
+    // compute TTC from both measurements
+    if (abs(minXPrev - minXCurr) < 1e-3)
+    {
+        TTC = 1e3;
+    }
+    else
+    {
+        TTC = minXCurr * dT / (minXPrev - minXCurr);
+    }
 }
 
-
+// Match bounding boxes based on the number matched keypoints between them
 void matchBoundingBoxes(std::vector<cv::DMatch> &matches, std::map<int, int> &bbBestMatches, DataFrame &prevFrame, DataFrame &currFrame)
 {
-    // ...
+    // Outer loop over all bounding boxes in the current image
+    for (auto bboxCurr : currFrame.boundingBoxes)
+    {  
+        // For each bounding box, make a list of all the indices of bounding boxes in the previous image, with keypoints that are
+        // matched with the current bounding box. The number of repeated index shows the number of matched keypoint for that 
+        // specific bounding box.
+        std::list<int> boxMatches;
+        for (auto match : matches)
+        {
+            if (bboxCurr.roi.contains(currFrame.keypoints[match.trainIdx].pt))
+            {
+                for (auto bboxPrev : prevFrame.boundingBoxes)
+                {
+                    if (bboxPrev.roi.contains(prevFrame.keypoints[match.queryIdx].pt))
+                    {
+                        boxMatches.push_back(bboxPrev.boxID);
+                    }
+                }
+            }
+        }
+        if (boxMatches.size() > 0)
+        {
+            // The best match is the one with maximum number of occurance in the list. To find that,
+            // count number of occurance for each unique index value.
+            auto uniqueIndices(boxMatches);
+            uniqueIndices.sort();
+            uniqueIndices.unique();
+    
+            int bestIndex = *uniqueIndices.begin();
+            int maxOccurance = std::count(boxMatches.begin(), boxMatches.end(), bestIndex);
+            int occurance = 0;
+            if (uniqueIndices.size() > 1)
+            {
+                for (auto itr1 = uniqueIndices.begin(); itr1 != uniqueIndices.end(); itr1++)
+                {
+                    occurance = std::count(boxMatches.begin(), boxMatches.end(), *itr1);
+                    if (occurance > maxOccurance)
+                    {
+                        maxOccurance = occurance;
+                        bestIndex = *itr1;
+                    }
+                }
+
+            }
+            bbBestMatches.insert(std::make_pair(bestIndex, bboxCurr.boxID));
+        }
+    }
 }
