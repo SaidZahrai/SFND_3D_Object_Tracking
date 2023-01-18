@@ -10,46 +10,11 @@ The tasks to carry out are:
 
 ## Results and conclusion
 
-The figure below shows the final results. FAST detector together with BRIEF descriptor appears to offer good combination. According to the previous project, the combination is also computationally efficient and fastest combination for tracking. The implementation of Time To Collision estimate follws the course material with taking the median value of distance ratios between the previous image and the current image for estimating the final value.
+As shown below, after filtering outliers in both lidar points and key points, good and consistent results can be obtained from TTC estimate with lidar points and most of the combinations of detector/extractors. 
 
-The point cloud was first "filtered" by a step of Euclidean Clustering that eliminated small clusters. After that, the closest point in the remaining cloud is used for estimating the Time To Collision.
+AKAZE performs well, both as detector and as extractor with all other detectors. ORB, on the other hand does not perform well with any detector. Results with FAST and BRIEF or FREAK, HARRIS with BRIEF, BRISK or SIFT extractors, as well as SHITOMASI detector together with FREAK extractor are not not as good as other combinations.
 
-<center><img src="images/TTC_Final.png"/></center>
-<center>Final result obtained with orange) FAST detectorr, BRIEF descriptor, Brute Force matching and 
-
-KNN with k = 2 selection and blue) Using point cloud with clustering out smaller clusters.
-</center>
-
-### Point cloud
-
-The figure below shows the estimate based on the closest point without any filtering or averaging. As can be seen there sudden variations can be seen. 
-<center>
-  <img src="images/TTC_Lidar_closest.png"/>
-</center>
-
-### Camera
-All combinations of detectors and descriptors were tested together with Brute Force matching and KNN(k=2) selector. Certain combinations were not performing well, while several detectors were quite successful. FAST was producing generally good result and was selected due to its numerical effciency. Equally, BRIEF was performing well and is fast. 
-#### Detectors
-Below, results of different detectors together with BRIEF as descriptor are shown.
-<center>
-  <img src="images/detectorAKAZE.png"/> 
-  <img src="images/detectorFAST.png"/> 
-  <img src="images/detectorHARRIS.png"/> 
-  <img src="images/detectorORB.png"/> 
-  <img src="images/detectorSHITOMASI.png"/> 
-  <img src="images/detectorSIFT.png"/> 
-</center>
-
-
-#### Descriptors
-Below, results of different descriptor together with FAST as detector are shown.
-<center>
-  <img src="images/descriptorBRIEF.png"/> 
-  <img src="images/descriptorBRISK.png"/> 
-  <img src="images/descriptorFREAK.png"/> 
-  <img src="images/descriptorORB.png"/> 
-  <img src="images/descriptorSIFT.png"/> 
-</center>
+The details are shown below.
 
 ## Theory and methods
 <center>
@@ -194,19 +159,67 @@ void computeTTCLidar(std::vector<LidarPoint> &lidarPointsPrev,
 
 In this method, Euclidean Clustering has been used to find the main part of the front car. The definition can be found in [clustering.h](src/clustering.h). 
 
-### FP.3 Associate Keypoint Correspondences with Bounding Boxes - Prepare the TTC computation based on camera measurements by associating keypoint correspondences to the bounding boxes and store all matches to a vector in the respective bounding box.
+### FP.3 Associate Keypoint Correspondences with Bounding Boxes - Prepare the TTC computation based on camera measurements by associating keypoint correspondences to the bounding boxes and store all matches to a vector in the respective bounding box. Outliers below 1st quartil and above 3rd quartil are identified and extracted according to the 1.5xIQR rule
 
 ```C++
 // associate a given bounding box with the keypoints it contains
 void clusterKptMatchesWithROI(BoundingBox &boundingBox, std::vector<cv::KeyPoint> &kptsPrev, std::vector<cv::KeyPoint> &kptsCurr, std::vector<cv::DMatch> &kptMatches)
 {
+    struct kptref
+    {
+        cv::KeyPoint kp;
+        cv::DMatch m;
+        double sqDistanceSum;
+    };
+
+    vector<kptref> inside_kps;
+    
+    int index = 0;
     for (auto match : kptMatches)
     {
         if (boundingBox.roi.contains(kptsCurr.at(match.trainIdx).pt))
         {
-            boundingBox.kptMatches.push_back(match);
-            boundingBox.keypoints.push_back(kptsCurr.at(match.trainIdx));
+            kptref ref;
+            ref.kp = kptsCurr.at(match.trainIdx);
+            ref.m = match;
+            ref.sqDistanceSum = 0.0;
+            inside_kps.push_back(ref);
         }
+    }
+    if (inside_kps.size() > 0)
+    {
+        for (auto it1 = inside_kps.begin(); it1 != inside_kps.end();  it1++)
+        {
+            it1->sqDistanceSum = 0;
+            for (auto it2 = inside_kps.begin(); it2 != inside_kps.end();  it2++)
+            { 
+                it1->sqDistanceSum += (it1->kp.pt.x - it2->kp.pt.x)*(it1->kp.pt.x - it2->kp.pt.x) +
+                                    (it1->kp.pt.y - it2->kp.pt.y)*(it1->kp.pt.y - it2->kp.pt.y);
+            }
+        }
+        // Outliers are identified and extracted using the 1.5xIQR rule
+        std::sort(inside_kps.begin(), inside_kps.end(), [](kptref a, kptref b){return a.sqDistanceSum < b.sqDistanceSum;});
+        long medIndex = floor(inside_kps.size() / 2.0);
+        double medDist = inside_kps.size() % 2 == 0 ? 
+        (inside_kps[medIndex - 1].sqDistanceSum + inside_kps[medIndex].sqDistanceSum) / 2.0 : inside_kps[medIndex].sqDistanceSum;
+        long Q1Index = floor(medIndex / 2.0);
+        double Q1Val = medIndex % 2 == 0 ? 
+        (inside_kps[Q1Index - 1].sqDistanceSum + inside_kps[Q1Index].sqDistanceSum) / 2.0 : inside_kps[Q1Index].sqDistanceSum;
+        long Q3Index = inside_kps.size() - floor(medIndex / 2.0);
+        double Q3Val = medIndex % 2 == 0 ? 
+        (inside_kps[Q3Index - 1].sqDistanceSum + inside_kps[Q3Index].sqDistanceSum) / 2.0 : inside_kps[Q3Index].sqDistanceSum;
+        double IQR = Q3Val - Q1Val;
+        double x1IQR = Q1Val - 1.5 * IQR, x3IQR = Q3Val + 1.5 * IQR;
+
+        for (auto it1 = inside_kps.begin(); it1 != inside_kps.end();  it1++) 
+        {
+            if ((it1->sqDistanceSum > x1IQR) && (it1->sqDistanceSum < x3IQR))
+            {
+                boundingBox.kptMatches.push_back(it1->m);
+                boundingBox.keypoints.push_back(it1->kp);
+            }
+        }
+        // cout << " Number of keypoints outliers according to the 1.5xIQR rule: " << inside_kps.size() - boundingBox.keypoints.size() << endl;
     }
 }
 
@@ -278,16 +291,151 @@ void computeTTCCamera(std::vector<cv::KeyPoint> &kptsPrev, std::vector<cv::KeyPo
 
 ### FP.5 Performance Evaluation 1 - Find examples where the TTC estimate of the Lidar sensor does not seem plausible. Describe your observations and provide a sound argumentation why you think this happened.
 
-Images 7 and 17 have unexpected TTC values. At 7, a high value is predicted, meaning that the relative speed is predicted to be lower than neighboring time points. At 17, a negative value is calculated, meaning that the previous point cloud contains a point closer to the vehicle than what can be seen in the current image. Such problems can occur when a single closest point is used. 
+The figure below shows the results when only the closest point was selected.
+<center>
+  <img src="images/TTC_Lidar_closest.png"/>
+</center>
+
+Images 7 and 17 have unexpected TTC values. At 7, a high value is predicted, meaning that the relative speed is predicted to be lower than neighboring time points. At 17, a negative value is calculated, meaning that the previous point cloud contains a point closer to the vehicle than what can be seen in the current image. Such problems can occur when a single closest point is used. This improved method was used in all the results shown below.
 
 Using e.g. median point will make the process more stable, but I found it somewhat random. In my implementation, I use Euclidean Clustering to eliminate clusters with fewer number of points.
 
 ### FP.6 Performance Evaluation 2 - Run several detector / descriptor combinations and look at the differences in TTC estimation. Find out which methods perform best and also include several examples where camera-based TTC estimation is way off. As with Lidar, describe your observations again and also look into potential reasons.
 
-All combinations were tested. This can be repeated with the script [run_script.sh](run_script.sh) and results can be processed with [make_tables.sh](make_tables.sh). While some methods, like ORB did not perform well, many combinations produced stable results. FAST+BRIEF appear to be fast and produce good results.
 
-For a good combination, I could not see any unusual behavior. I assume that is related to the implementation and use of median distance ratio, as suggested and done in the class exercises. 
+The execution can be looped with the script [run_script.sh](run_script.sh) and results can be processed with [make_tables.sh](make_tables.sh). All combinations were tested and the results are presented below, with Brute Force matching and KNN with k = 2 selection and blue) Using point cloud with clustering out smaller clusters.
 
+Assuming that you are still in the `build` directory, the below commands create a csv file with all results included:
+
+```sh
+../run_script.sh > results_all.txt
+../make_tables.sh > all_tables.csv
+```
+You can then plot the results with the following Python script:
+
+```Python
+import pandas as pd
+import matplotlib.pyplot as plt
+
+df=pd.read_csv('your/path/to/all_tables.csv')
+
+detectors = ["AKAZE", "FAST", "HARRIS", "ORB", "SHITOMASI", "SIFT"]
+extractors = ["AKAZE", "BRIEF", "BRISK", "FREAK", "ORB", "SIFT"]
+
+for detector in detectors:
+    for extractor in extractors:
+        d1 = df[df["Detector"]==detector]
+        d2 = d1[d1["Extractor"]==extractor]
+        if (len(d2.index)>0):
+            fig = d2.plot(title=detector + "/" + extractor + " (orange) and Lidar (blue)", x="Image", 
+                    y=["TTC_Lidar", "TTC_Camera"], style="o",xlim=[0, 20],ylim=[-10, 40], 
+                        figsize=(8,4), xticks=d2.Image).get_figure()
+            plt.savefig(detector+"-"+extractor+".png", dpi=300, bbox_inches = 'tight')
+
+```    
+
+<center>
+  <img src="images/AKAZE-AKAZE.png" width="500" height="250"/>
+</center>
+<center>
+  <img src="images/AKAZE-BRIEF.png" width="500" height="250"/>
+</center>
+<center>
+  <img src="images/AKAZE-BRISK.png" width="500" height="250"/>
+</center>
+<center>
+  <img src="images/AKAZE-FREAK.png" width="500" height="250"/>
+</center>
+<center>
+  <img src="images/AKAZE-ORB.png" width="500" height="250"/>
+</center>
+<center>
+  <img src="images/AKAZE-SIFT.png" width="500" height="250"/>
+</center>
+
+
+<center>
+  <img src="images/FAST-BRIEF.png"  width="500" height="250"/>
+</center>
+<center>
+  <img src="images/FAST-BRISK.png" width="500" height="250"/>
+</center>
+<center>
+  <img src="images/FAST-FREAK.png" width="500" height="250"/>
+</center>
+<center>
+  <img src="images/FAST-ORB.png" width="500" height="250"/>
+</center>
+<center>
+  <img src="images/FAST-SIFT.png" width="500" height="250"/>
+</center>
+
+<center>
+  <img src="images/HARRIS-BRIEF.png" width="500" height="250"/>
+</center>
+<center>
+  <img src="images/HARRIS-BRISK.png" width="500" height="250"/>
+</center>
+<center>
+  <img src="images/HARRIS-FREAK.png" width="500" height="250"/>
+</center>
+<center>
+  <img src="images/HARRIS-ORB.png" width="500" height="250"/>
+</center>
+<center>
+  <img src="images/HARRIS-SIFT.png" width="500" height="250"/>
+</center>
+
+<center>
+  <img src="images/ORB-BRIEF.png" width="500" height="250"/>
+</center>
+<center>
+  <img src="images/ORB-BRISK.png" width="500" height="250"/>
+</center>
+<center>
+  <img src="images/ORB-FREAK.png" width="500" height="250"/>
+</center>
+<center>
+  <img src="images/ORB-ORB.png" width="500" height="250"/>
+</center>
+<center>
+  <img src="images/ORB-SIFT.png" width="500" height="250"/>
+</center>
+
+<center>
+  <img src="images/SHITOMASI-BRIEF.png" width="500" height="250"/>
+</center>
+<center>
+  <img src="images/SHITOMASI-BRISK.png" width="500" height="250"/>
+</center>
+<center>
+  <img src="images/SHITOMASI-FREAK.png" width="500" height="250"/>
+</center>
+<center>
+  <img src="images/SHITOMASI-ORB.png" width="500" height="250"/>
+</center>
+<center>
+  <img src="images/SHITOMASI-SIFT.png" width="500" height="250"/>
+</center>
+
+<center>
+  <img src="images/SIFT-BRIEF.png" width="500" height="250"/>
+</center>
+<center>
+  <img src="images/SIFT-BRISK.png" width="500" height="250"/>
+</center>
+<center>
+  <img src="images/SIFT-FREAK.png" width="500" height="250"/>
+</center>
+<center>
+  <img src="images/SIFT-SIFT.png" width="500" height="250"/>
+</center>
+
+As can be seen above, the majority of the 30 combinations have reasonable results. The cases that were performing poorly are:
+1. ORB as detector with any extractor
+2. FAST detector with BRIEF and FREAK extractors
+3. HARRIS detector with BRIEF, BRISK or SIFT extractors
+4. SHITOMASI detector with FREAK extractor
  
 
 

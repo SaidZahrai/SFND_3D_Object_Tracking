@@ -140,15 +140,64 @@ void show3DObjects(std::vector<BoundingBox> &boundingBoxes, cv::Size worldSize, 
 // associate a given bounding box with the keypoints it contains
 void clusterKptMatchesWithROI(BoundingBox &boundingBox, std::vector<cv::KeyPoint> &kptsPrev, std::vector<cv::KeyPoint> &kptsCurr, std::vector<cv::DMatch> &kptMatches)
 {
+    struct kptref
+    {
+        cv::KeyPoint kp;
+        cv::DMatch m;
+        double sqDistanceSum;
+    };
+
+    vector<kptref> inside_kps;
+    
+    int index = 0;
     for (auto match : kptMatches)
     {
         if (boundingBox.roi.contains(kptsCurr.at(match.trainIdx).pt))
         {
-            boundingBox.kptMatches.push_back(match);
-            boundingBox.keypoints.push_back(kptsCurr.at(match.trainIdx));
+            kptref ref;
+            ref.kp = kptsCurr.at(match.trainIdx);
+            ref.m = match;
+            ref.sqDistanceSum = 0.0;
+            inside_kps.push_back(ref);
         }
     }
+    if (inside_kps.size() > 0)
+    {
+        for (auto it1 = inside_kps.begin(); it1 != inside_kps.end();  it1++)
+        {
+            it1->sqDistanceSum = 0;
+            for (auto it2 = inside_kps.begin(); it2 != inside_kps.end();  it2++)
+            { 
+                it1->sqDistanceSum += (it1->kp.pt.x - it2->kp.pt.x)*(it1->kp.pt.x - it2->kp.pt.x) +
+                                    (it1->kp.pt.y - it2->kp.pt.y)*(it1->kp.pt.y - it2->kp.pt.y);
+            }
+        }
+        // Outliers are identified and extracted using the 1.5xIQR rule
+        std::sort(inside_kps.begin(), inside_kps.end(), [](kptref a, kptref b){return a.sqDistanceSum < b.sqDistanceSum;});
+        long medIndex = floor(inside_kps.size() / 2.0);
+        double medDist = inside_kps.size() % 2 == 0 ? 
+        (inside_kps[medIndex - 1].sqDistanceSum + inside_kps[medIndex].sqDistanceSum) / 2.0 : inside_kps[medIndex].sqDistanceSum;
+        long Q1Index = floor(medIndex / 2.0);
+        double Q1Val = medIndex % 2 == 0 ? 
+        (inside_kps[Q1Index - 1].sqDistanceSum + inside_kps[Q1Index].sqDistanceSum) / 2.0 : inside_kps[Q1Index].sqDistanceSum;
+        long Q3Index = inside_kps.size() - floor(medIndex / 2.0);
+        double Q3Val = medIndex % 2 == 0 ? 
+        (inside_kps[Q3Index - 1].sqDistanceSum + inside_kps[Q3Index].sqDistanceSum) / 2.0 : inside_kps[Q3Index].sqDistanceSum;
+        double IQR = Q3Val - Q1Val;
+        double x1IQR = Q1Val - 1.5 * IQR, x3IQR = Q3Val + 1.5 * IQR;
+
+        for (auto it1 = inside_kps.begin(); it1 != inside_kps.end();  it1++) 
+        {
+            if ((it1->sqDistanceSum > x1IQR) && (it1->sqDistanceSum < x3IQR))
+            {
+                boundingBox.kptMatches.push_back(it1->m);
+                boundingBox.keypoints.push_back(it1->kp);
+            }
+        }
+        // cout << " Number of keypoints outliers according to the 1.5xIQR rule: " << inside_kps.size() - boundingBox.keypoints.size() << endl;
+    }
 }
+
 
 // Compute time-to-collision (TTC) based on keypoint correspondences in successive images
 void computeTTCCamera(std::vector<cv::KeyPoint> &kptsPrev, std::vector<cv::KeyPoint> &kptsCurr, 
